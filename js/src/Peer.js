@@ -161,7 +161,7 @@ module.exports = class Peer {
         ),
         Variant.from(
           "OnConsoleMessage",
-          "Something went wrong. Please try again."
+          "Something went wrong."
         )
       )
 
@@ -252,12 +252,14 @@ smstate|0`))
   }
 
   audio(file, delay = 0) {
-    this.send(TextPacket.from(
-      0x3,
-      "action|play_sfx",
-      `file|${file}`,
-      `delayMS|${delay}`
-    ));
+      if (this.data.currentWorld != "EXIT") {
+      this.send(TextPacket.from(
+        0x3,
+        "action|play_sfx",
+        `file|${file}`,
+        `delayMS|${delay}`
+      ));
+    }
   }
 
   inventory() {
@@ -315,7 +317,7 @@ smstate|0`))
       [this.data.clothes.shoes, this.data.clothes.face, this.data.clothes.hand],
       [this.data.clothes.back, this.data.clothes.mask, this.data.clothes.necklace],
       this.data.skinColor ?? Constants.DEFAULT_SKIN,
-      [this.data.clothes.ances, silenced ? 0 : 1, 0.0]
+      [this.data.clothes.ances, silenced ? 0 : 0, 0.0]
     )
   }
 
@@ -401,3 +403,4 @@ smstate|0`))
     return Native.isConnected(this.data.connectID)
   }
 } 
+

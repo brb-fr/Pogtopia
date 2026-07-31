@@ -547,9 +547,9 @@ interface WorldTile {
   hitsTaken?: number
 
   /**
-   * The date on when the breakHits shall reset. (You would have to implement it yourself.)
+   * The timeout on when the breakHits shall reset
    */
-  resetAfter?: number
+  resetAfterTimeout?: number
 }
 
 
@@ -1038,7 +1038,7 @@ export class Peer {
 
   /**
    * Returns the packet for clothing
-   * @param silenced Whether or not to play the sfx when wearing clothes. Defaults to false
+   * @param silenced Whether or not to play the sfx when wearing clothes. Defaults to true
    */
   public cloth_packet(silenced?: boolean): Variant;
 
