@@ -1,251 +1,411 @@
+const Native = require("./NativeWrapper");
+const World = require("./World");
+const Variant = require("./Packet/Variant");
+const TextPacket = require("./Packet/TextPacket");
 const TankPacket = require("./Packet/TankPacket");
+const Constants = require('./Constants')
 
-module.exports = class World {
+module.exports = class Peer {
   constructor(server, data = {}) {
+    if (!data || !data.connectID && isNaN(data.connectID))
+      throw new Error("Server crash due to invalid peer data.");
+
+    this.data = data || null;
     this.server = server;
+  }
+
+  async create(data, saveToCache) {
     this.data = data;
-  }
 
-  static create(server, name) {
-    if (!name) return
+    if (saveToCache) {
+      const players = await this.server.cache.get("players");
+      if (!Array.isArray(players)) return;
 
-    return new World(server, { name })
-  }
-
-  hasData() {
-    const keys = Object.keys(this.data).filter(key => key !== "name");
-
-    return keys.length < 1 ? false : true;
-  }
-
-  async fetch(shouldGenerate = true) {
-    if (!this.data.name) return;
-    
-    const worldStr = await this.server.cache.get(`world:${this.data.name}`);
-    
-    if (worldStr) {
-      this.data = worldStr;
-      this.fixData()
-    } else {
-      const world = await this.server.collections.worlds.findOne({ name: this.data.name });
-      const width = this.data.name === "TINY" ? 50 : 100;
-      const height = this.data.name === "TALL" ? 100 : (this.data.name === "TINY" ? 50 : 60);
-
-      if (!world && shouldGenerate) // generate
-        await this.generate(width, height);
-      else {
-        if (world) {
-          this.data = world;
-          this.fixData()
-
-          await this.server.cache.set(`world:${this.data.name}`, this.data);
-        }
-      }
-    }
-  }
-
-  async generate(width = 100, height = 60) {
-    if (typeof this.server.config.worldGenerator === 'function') {
-      this.data = await this.server.config.worldGenerator(this, width, height)
-      return
-    }
-    const droppedItems = []
-    const tileCount = width * height;
-    const tiles = []
-    const mainDoorPosition = Math.floor(Math.random() * width);
-
-    const BEDROCK_START_LEVEL = height - 5;
-    const DIRT_START_LEVEL = height / 3;
-
-    let x = 0;
-    let y = 0;
-
-    for (let i = 0; i < tileCount; i++) {
-      if (x >= width) {
-        x = 0;
-        y++;
-      }
-
-      const tile = {
-        fg: 0,
-        bg: 0,
-        x,
-        droppedItems: [],
-        y,
-        hitsTaken: 0
-      }
-
-      if (y >= BEDROCK_START_LEVEL || (y === DIRT_START_LEVEL && x === mainDoorPosition)) {
-        tile.fg = 8;
-        tile.bg = 14;
-      } else if (y >= DIRT_START_LEVEL && y < BEDROCK_START_LEVEL) {
-        tile.fg = 2;
-        tile.bg = 14;
-      } else if (y === DIRT_START_LEVEL - 1 && x === mainDoorPosition) {
-        tile.fg = 6;
-
-        // Main Door options
-        tile.label = "EXIT";
-        tile.doorDestination = "EXIT";
-        tile.isDoor = true;
-      }
-
-      tiles.push(tile);
-
-      x++;
+      players[this.data.connectID] = this.data;
+      await this.server.cache.set("players", players);
     }
 
-    this.data = {
-      name: this.data.name,
-      droppedItems,
-      tiles,
-      tileCount,
-      width,
-      height,
-      playerCount: 0
-    };
-
-    await this.server.collections.worlds.replaceOne({ name: this.data.name }, this.data, { upsert: true });
-    await this.server.cache.set(`world:${this.data.name}`, this.data);
+    await this.server.collections.players.insertOne(data);
   }
 
-  async serialize() {
-    if (!this.hasData())
-      await this.fetch();
-
-    let totalBufferSize = 0;
-
-    // calculate total buffer size
-    if (typeof this.server.config.worldTilesSize === 'function')
-      totalBufferSize = this.server.config.worldTilesSize(this.data.tiles)
-    else {
-      for (const tile of this.data.tiles) {
-        totalBufferSize += 8;
-  
-        switch (tile.fg) {
-          case 6: { // main door
-            totalBufferSize += 4 + (tile.label.length || 0);
-            break;
-          }
-        }
-      }
-    }
-
-    const WORLD_INFO_SIZE = 20 + this.data.name.length;
-    const DROPPED_ITEMS_INFO_SIZE = 8; // dropped item count and last dropped item id
-    const WORLD_WEATHER_SIZE = 15;     // 6 bytes before weather, 8 bytes after. total: 15 bytes
-
-    const WORLD_VERSION = 0x0f;
-    const WORLD_NAME = this.data.name ?? "";
-
-    totalBufferSize += WORLD_INFO_SIZE + DROPPED_ITEMS_INFO_SIZE + WORLD_WEATHER_SIZE;
-
-    const buffer = Buffer.alloc(totalBufferSize);
-    
-    buffer.writeUInt8(WORLD_VERSION);
-    buffer.writeUInt16LE(WORLD_NAME.length, 6);
-    buffer.write(WORLD_NAME, 8);
-    buffer.writeUInt32LE(this.data.width, 8 + WORLD_NAME.length);
-    buffer.writeUInt32LE(this.data.height, 12 + WORLD_NAME.length);
-    buffer.writeUInt32LE(this.data.tileCount, 16 + WORLD_NAME.length);
-
-    let pos = 20 + WORLD_NAME.length;
-
-    if (typeof this.server.config.worldSerializationCall === 'function')
-      this.server.config.worldSerializationCall(pos, buffer, this.data.tiles)
-    else for (const tile of this.data.tiles) {
-      buffer.writeUInt16LE(tile.fg, pos);
-      buffer.writeUInt16LE(tile.bg, pos + 2);
-      
-      pos += 4;
-
-      switch (tile.fg) {
-        case 6: { // main door
-          const DOOR_LABEL = tile.label || "";
-
-          buffer.writeUInt8(0x1, pos + 2);
-          buffer.writeUInt8(0x1, pos + 4);
-          buffer.writeUInt16LE(DOOR_LABEL.length, pos + 5);
-          buffer.write(DOOR_LABEL, pos + 7);
-          
-          pos += 8 + DOOR_LABEL.length;
-          break;
-        }
-
-        default: {
-          pos += 4;
-          break;
-        }
-      }
-    }
-
-    return TankPacket.from({
-      type: 0x4,
-      extraData: () => buffer
-    });
+  send(data) {
+    Native.send(data, this.data.connectID);
   }
 
-  async saveToCache() {
-    if (!this.hasData()) return;
+  send_multiple(...data) {
+    Native.send_multiple(data, this.data.connectID)
+  }
 
-    await this.server.cache.set(`world:${this.data.name}`, this.data);
+  async disconnect(type) {
+    type = type?.toLowerCase();
+
+    await this.fetch('cache')
+
+    Native.disconnect(type, this.data.connectID);
+    if (this.hasPlayerData()) {
+      this.data.hasMovedInWorld = false
+      this.data.online          = false
+
+      await this.saveToDb()
+    }
+
+    const players = await this.server.cache.get("players");
+
+    if (!Array.isArray(players) || !players[this.data.connectID]) return;
+    players[this.data.connectID] = null;
+
+    await this.server.cache.set("players", players);
+  }
+
+  requestLoginInformation() {
+    const buffer = Buffer.alloc(4);
+    buffer.writeUInt8(0x1);
+
+    this.send(buffer);
   }
 
   async saveToDb() {
-    if (!this.hasData()) return;
-
-    delete this.data["_id"];
-    await this.server.collections.worlds.replaceOne({ name: this.data.name }, this.data, { upsert: true });
-  }
-
-  async uncache() {
-    await this.server.cache.del(`world:${this.data.name}`);
-  }
-
-  fixData() {
-    if (!this.hasData()) return
-
-    const types = {
-      name: 'string',
-      width: 'number',
-      height: 'number',
-      tileCount: 'number',
-      tiles: 'array',
-      droppedItems: 'array',
-      playerCount: 'number'
+    delete this.data["_id"]; // we need this gone if present
+    const data = Object.assign(
+      {},
+      this.data
+    )
+    if (this.data.displayName) {
+       data.displayName = data.displayName.replace(/`.|`/g, '')
     }
+    await this.server.collections.players.replaceOne({ userID: data.userID }, data, { upsert: true });
+  }
 
-    const keys = Object.entries(types)
-    keys.forEach(
-      entry => {
-        const key = entry[0]
-        const val = entry[1]
+  async saveToCache() {
+    const players = await this.server.cache.get("players");
 
-        switch (val) {
-          case 'array': {
-            if (!Array.isArray(this.data[key]))
-              this.data[key] = []
-            break
-          }
-          
-          case 'string': {
-            if (typeof this.data[key] !== 'string')
-              this.data[key] = ''
-            break
-          }
+    if (!Array.isArray(players)) return;
+    players[this.data.connectID] = this.data;
 
-          case 'number': {
-            if (typeof this.data[key] !== 'number')
-              this.data[key] = 0
-            break
-          }
+    await this.server.cache.set("players", players);
+  }
 
-          default: {
-            this.data[key] = {}
-            break
-          }
+  hasPlayerData() {
+    return Object.keys(this.data).length > 1 ? true : false;
+  }
+
+  async setOnline(cache, online = false) {
+    if (!this.hasPlayerData()) return
+
+    this.data.online = online
+
+    if (cache)
+      await this.saveToCache()
+      
+    await this.saveToDb()
+  }
+
+  async alreadyInCache(userID = null) {
+    const players = await this.server.cache.get("players");
+    if (!Array.isArray(players)) return;
+
+    const condition = userID ?
+                        players.find(p => p && p.userID === userID) :
+                        players[this.data.connectID]
+    
+    if (!condition)
+      return null;
+    else return condition;
+  }
+
+  async fetch(type, filter) {
+    if (!filter) filter = this.data;
+
+    switch (type) {
+      case "cache": {
+        const players = await this.server.cache.get("players");
+        if (!Array.isArray(players)) return;
+
+        const data = players[this.data.connectID];
+
+        if (data) {
+          data.connectID = this.data.connectID;
+          this.data = data;
         }
+
+        break;
       }
+
+      case "db": {
+        if (!this.server.collections) return
+
+        let result = await this.server.collections.players.findOne(filter);
+        if (!result)
+          result = {};
+        else delete result["_id"];
+
+        result.connectID = this.data.connectID;
+
+        this.data = result;
+        break;
+      }
+    }
+  }
+
+  async join(name, isSuperMod, xPos, yPos) {
+    if (!name)
+      name = ''
+
+    name = name.toUpperCase().trim();
+
+    if (!this.hasPlayerData() || name.match(/\W+|_/g) || name.length > 24 || name.length < 1)
+      return this.send_multiple(
+        Variant.from(
+          "OnFailedToEnterWorld",
+          1
+        ),
+        Variant.from(
+          "OnConsoleMessage",
+          "Something went wrong. Please try again."
+        )
+      )
+
+    if (name === 'EXIT')
+      return this.send_multiple(
+        Variant.from(
+          "OnFailedToEnterWorld",
+          1
+        ),
+        Variant.from(
+          "OnConsoleMessage",
+          "`wEXIT`` from what?"
+        )
+      )
+
+    const world  = new World(this.server, { name });
+    const packet = await world.serialize();
+
+    this.send(packet);
+
+    const mainDoor = world.data.tiles.find(tile => tile.fg === 6);
+
+    world.data.playerCount++
+
+    const x = typeof xPos === 'number' ?
+                xPos :
+                mainDoor?.x || 0
+    const y = typeof yPos === 'number' ?
+                      yPos :
+                      mainDoor?.y || 0
+
+    this.data.x = x * 32;
+    this.data.y = y * 32;
+    this.data.currentWorld = name;
+    
+    await this.saveToCache();
+    await world.saveToCache()
+    this.audio("audio/door_open.wav", 20)
+
+    // send OnSpawn call
+    this.send(Variant.from(
+      "OnSpawn",
+      `spawn|avatar
+netID|${this.data.connectID}
+userID|${this.data.userID}
+colrect|0|0|20|30
+posXY|${this.data.x}|${this.data.y}
+name|${this.data.displayName}\`\`
+country|${this.data.country}
+invis|0
+mstate|0
+smstate|${isSuperMod ? 1 : 0}
+type|local`));
+
+    // loop through each player
+    this.server.forEach("player", (otherPeer) => {
+      if (otherPeer.data.userID !== this.data.userID && otherPeer.data.currentWorld === this.data.currentWorld && otherPeer.data.currentWorld !== "EXIT") {
+        // send ourselves to the other peers
+        otherPeer.audio("audio/door_open.wav")
+        otherPeer.send(Variant.from(
+          "OnSpawn",
+          `spawn|avatar
+netID|${this.data.connectID}
+userID|${this.data.userID}
+colrect|0|0|20|30
+posXY|${this.data.x}|${this.data.y}
+name|${this.data.displayName}\`\`
+country|${this.data.country}
+invis|0
+mstate|0
+smstate|${isSuperMod ? 1 : 0}`));
+
+        // send the peer to ourselves
+        this.send(Variant.from(
+          "OnSpawn",
+          `spawn|avatar
+netID|${otherPeer.data.connectID}
+userID|${otherPeer.data.userID}
+colrect|0|0|20|30
+posXY|${otherPeer.data.x}|${otherPeer.data.y}
+name|${otherPeer.data.displayName}\`\`
+country|${otherPeer.data.country}
+invis|0
+mstate|0
+smstate|0`))
+      }
+    });
+  }
+
+  audio(file, delay = 0) {
+      if (this.data.currentWorld != "EXIT") {
+      this.send(TextPacket.from(
+        0x3,
+        "action|play_sfx",
+        `file|${file}`,
+        `delayMS|${delay}`
+      ));
+    }
+  }
+
+  inventory() {
+  if (!this.data?.inventory?.items) return;
+
+  const items = this.data.inventory.items;
+  const maxSize = this.data.inventory.maxSize || 36;
+
+  const tank = TankPacket.from({
+    type: 0x9,
+    netID: this.data.connectID,
+    extraData: () => {
+      const buffer = Buffer.alloc(7 + (items.length * 4));
+      buffer.writeUInt8(0x1, 0);                 
+      buffer.writeUInt32LE(maxSize, 1);           
+      buffer.writeUInt16LE(items.length, 5);      
+      let pos = 7;
+      for (const item of items) {
+        buffer.writeUInt16LE(item.id, pos);
+        buffer.writeUInt8(item.amount, pos + 2);
+        const isEquipped = Object.values(this.data.clothes || {}).includes(item.id);
+        buffer.writeUInt8(isEquipped ? 0x1 : 0x0, pos + 3);
+        pos += 4;
+      }
+      return buffer;
+    }
+  });
+  const tankbuffer = tank.parse();
+  this.send(tankbuffer);
+}
+
+  async world(name, fetchDataAfter) {
+    if (typeof name === 'boolean')
+      fetchDataAfter = name
+
+    if (typeof name !== 'string')
+      name = this.data.currentWorld
+
+    const world = new World(this.server, { name })
+    if (fetchDataAfter)
+      await world.fetch(false)
+
+    return world
+  }
+
+  cloth_packet(silenced = true) {
+    if (!this.hasPlayerData()) return
+
+    return Variant.from(
+      {
+        netID: this.data.connectID
+      },
+      'OnSetClothing',
+      [this.data.clothes.hair, this.data.clothes.shirt, this.data.clothes.pants],
+      [this.data.clothes.shoes, this.data.clothes.face, this.data.clothes.hand],
+      [this.data.clothes.back, this.data.clothes.mask, this.data.clothes.necklace],
+      this.data.skinColor ?? Constants.DEFAULT_SKIN,
+      [this.data.clothes.ances, silenced ? 0 : 0, 0.0]
     )
   }
-}
+
+  async remove_item_from_inventory(id, amount = 1) {
+    const item = this.data.inventory.items.find(item => item.id === id)
+    if (!item ||
+        item.amount < 1) return
+
+    item.amount -= amount
+
+    if (item.amount < 1)
+      this.data.inventory.items = this.data.inventory.items.filter(item => item.id !== id)
+
+    await this.saveToCache()
+  }
+
+  async add_item_to_inventory(id, amount = 1) {
+    if (typeof amount !== 'string' ||
+        amount > 200)
+      amount = 1
+
+    const item = this.data.inventory.items.find(item => item.id === id)
+    if (!item &&
+        this.data.inventory.items.length < this.data.inventory.maxSize) {
+      this.data.inventory.items.push(
+        {
+          id: id,
+          amount
+        }
+      )
+    } else if (item) {
+      if (item.amount + amount > 200) return
+      item.amount += amount
+    }
+
+    await this.saveToCache()
+  }
+
+  async leave(sendToMenu) {
+    if (this.data.currentWorld === 'EXIT' || !this.data.currentWorld) return
+    const world = await this.world(this.data.currentWorld, true)
+    world.data.playerCount--
+    if (world.data.playerCount == 0) {
+      world.data.droppedItems.forEach((item, index) => {
+        if (item.id == 0) {
+          world.data.droppedItems.slice(index + 1)
+        }
+      })
+    }
+    this.data.hasMovedInWorld = false
+    this.data.displayName     = this.data.displayName.replace(
+                                  /`./g,
+                                  ''
+                                )
+    this.audio("audio/door_shut.wav")
+    if (sendToMenu)
+      this.send(
+        Variant.from('OnRequestWorldSelectMenu')
+      )
+
+    await this.server.forEach(
+      'player',
+      eachPeer => {
+        if (eachPeer.data.currentWorld === world.data.name &&
+            eachPeer.data.connectID !== this.data.connectID)
+          eachPeer.send(
+            Variant.from(
+              'OnRemove',
+              `netID|${this.data.connectID}`
+            )
+          )
+      }
+    )
+
+    if (world.data.playerCount < 1) { // remove to cache if empty
+      world.data.playerCount = 0
+
+      await world.saveToDb()
+      await world.uncache()
+    } else await world.saveToCache()
+
+    this.data.currentWorld = 'EXIT'
+    
+    await this.saveToCache()
+  }
+
+  isConnected() {
+    return Native.isConnected(this.data.connectID)
+  }
+} 
+
